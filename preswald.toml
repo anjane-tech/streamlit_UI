@@ -1,0 +1,6 @@
+[project]
+title = "Preswald Project"
+version = "0.1.0"
+port = 8501
+slug = "sample-787411"
+entrypoint = "main.py"
