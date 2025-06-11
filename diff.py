@@ -1,58 +1,174 @@
+import streamlit as st
+import snowflake.connector
 import duckdb
-import pandas as pd
-import preswald as st
 
-# Connect to existing DuckDB file
-con = duckdb.connect("mydata.duckdb")
+# ---------- Configuration ----------
+DUCKDB_FILE = "mydata.duckdb"
+INTERMEDIATE_DB = ":memory:"
 
-# Fetch joined data from both table sets
-df_old = con.execute("""
-    SELECT e.id, e.name, d.dept_name
-    FROM employee e
-    JOIN department d ON e.dept_id = d.id
-""").fetchdf()
+def get_snowflake_config():
+    return {
+        "user": "Ambika",
+        "password": "Snowflake#2025",
+        "account": "POEVRBR-DW28551",
+        "warehouse": "COMPUTE_WH",
+        "database": "RAW",
+        "schema": "TEST",
+        "role": "ACCOUNTADMIN"
+    }
 
-df_new = con.execute("""
-    SELECT e.id, e.name, d.dept_name
-    FROM employee2 e
-    JOIN department2 d ON e.dept_id = d.id
-""").fetchdf()
+# ---------- Functions ----------
+def fetch_query_snowflake_to_duckdb(sql_query, conn_params, intermediate_db, target_table_name):
+    try:
+        with snowflake.connector.connect(**conn_params) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_query)
+                data = cur.fetchall()
+                columns = [desc[0] for desc in cur.description]
 
-# Perform outer merge to detect mismatches
-df_merged = df_old.merge(df_new, on=["id", "name", "dept_name"], how="outer", indicator=True)
+        if not data:
+            st.warning("Source query returned no data!")
+            return columns, []
 
-# Split non-matching rows
-df_left = df_merged[df_merged["_merge"] == "left_only"].drop(columns=["_merge"])
-df_right = df_merged[df_merged["_merge"] == "right_only"].drop(columns=["_merge"])
+        with duckdb.connect(intermediate_db) as con:
+            con.execute(f'DROP TABLE IF EXISTS "{target_table_name}"')
+            col_defs = ", ".join([f'"{col}" TEXT' for col in columns])
+            con.execute(f'CREATE TABLE "{target_table_name}" ({col_defs})')
 
-# UI formatting constants
-title_left = "Non-Matching Rows in Old Table"
-title_right = "Non-Matching Rows in New Table"
-headers = ["id", "name", "dept_name"]
-col_widths = [5, 15, 20]  # Adjust width if needed
+            placeholders = ", ".join(["?"] * len(columns))
+            con.executemany(
+                f'INSERT INTO "{target_table_name}" VALUES ({placeholders})',
+                data
+            )
 
-def format_row(row, widths):
-    return "  ".join(str(col).ljust(w) for col, w in zip(row, widths))
+        return columns, data
+    except Exception as e:
+        st.error(f"Error fetching data from Snowflake: {e}")
+        return [], []
 
-# Format rows
-header_line = format_row(headers, col_widths)
-left_rows = [format_row(row, col_widths) for row in df_left.itertuples(index=False)]
-right_rows = [format_row(row, col_widths) for row in df_right.itertuples(index=False)]
+def fetch_data_from_duckdb_query(sql_query, db_file):
+    try:
+        with duckdb.connect(database=db_file) as con:
+            res = con.execute(sql_query)
+            cols = [desc[0] for desc in res.description]
+            rows = res.fetchall()
+        return cols, rows
+    except Exception as e:
+        st.error(f"Error fetching data from DuckDB: {e}")
+        return [], []
 
-# Pad for visual alignment
-max_len = max(len(left_rows), len(right_rows))
-left_rows += [" " * sum(col_widths)] * (max_len - len(left_rows))
-right_rows += [" " * sum(col_widths)] * (max_len - len(right_rows))
+def compare_data(source_data, target_data):
+    source_set = set(map(lambda r: (r,) if not isinstance(r, (list, tuple)) else tuple(r), source_data))
+    target_set = set(map(lambda r: (r,) if not isinstance(r, (list, tuple)) else tuple(r), target_data))
+    in_source_not_target = list(source_set - target_set)
+    in_target_not_source = list(target_set - source_set)
+    return in_source_not_target, in_target_not_source
 
-# Combine lines
-lines = [
-    title_left.ljust(sum(col_widths) + 6) + "|   " + title_right,
-    header_line.ljust(sum(col_widths) + 6) + "|   " + header_line
-]
-for l, r in zip(left_rows, right_rows):
-    lines.append(l.ljust(sum(col_widths) + 6) + "|   " + r)
+def normalize_columns(cols):
+    return [col.strip().lower() for col in cols]
 
-# Display in UI
-st.text("""
-```
-""" + "\n".join(lines) + "\n```""")
+def flatten_rows(rows):
+    """Flatten rows of one-column data: [(1,), (2,), ...] -> [1, 2, ...]."""
+    if rows and len(rows[0]) == 1:
+        return [r[0] for r in rows]
+    return rows
+
+def render_table(columns, data, title):
+    st.write(f"#### {title}")
+    html = "<table style='border-collapse: collapse; width: 100%;'>"
+    html += "<tr>" + "".join([f"<th style='border:1px solid #999; padding:4px;'>{col}</th>" for col in columns]) + "</tr>"
+    for row in data:
+        html += "<tr>" + "".join([f"<td style='border:1px solid #999; padding:4px;'>{val}</td>" for val in row]) + "</tr>"
+    html += "</table>"
+    st.markdown(html, unsafe_allow_html=True)
+
+# ---------- UI ----------
+st.set_page_config(page_title="Data Comparison Tool - Differences Only", layout="wide")
+st.title("🔍 Data Comparison Tool - Query-based Differences")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Source Query")
+    source_type = st.selectbox("Source Type", ["Snowflake", "DuckDB"])
+    source_query = st.text_area(
+        "Enter SQL query for Source",
+        "SELECT * FROM my_table LIMIT 10"
+    )
+
+with col2:
+    st.subheader("Target Query (DuckDB)")
+    target_query = st.text_area(
+        "Enter SQL query for Target (DuckDB)",
+        "SELECT * FROM my_table LIMIT 10"
+    )
+
+if st.button("Show Differences Only"):
+    st.write("---")
+
+    # Fetch Source data
+    if source_type == "Snowflake":
+        sf_config = get_snowflake_config()
+        sf_cols, sf_data = fetch_query_snowflake_to_duckdb(
+            source_query,
+            sf_config,
+            INTERMEDIATE_DB,
+            "intermediate_source"
+        )
+    else:
+        sf_cols, sf_data = fetch_data_from_duckdb_query(source_query, DUCKDB_FILE)
+
+    # Fetch Target data
+    duckdb_cols, duckdb_data = fetch_data_from_duckdb_query(target_query, DUCKDB_FILE)
+
+    # Display raw data (no tuples)
+    if sf_cols and sf_data:
+        sf_data = [list(row) if isinstance(row, (list, tuple)) else [row] for row in sf_data]
+        render_table(sf_cols, sf_data, "🔹 Source Query Results")
+    else:
+        st.warning("No data in Source Query results.")
+
+    if duckdb_cols and duckdb_data:
+        duckdb_data = [list(row) if isinstance(row, (list, tuple)) else [row] for row in duckdb_data]
+        render_table(duckdb_cols, duckdb_data, "🔸 Target Query Results")
+    else:
+        st.warning("No data in Target Query results.")
+
+    # Normalize and flatten for comparison
+    sf_cols_normalized = normalize_columns(sf_cols)
+    duckdb_cols_normalized = normalize_columns(duckdb_cols)
+
+    if sf_cols_normalized != duckdb_cols_normalized:
+        st.warning("⚠️ Column mismatch detected! (but data differences will still be shown)")
+        st.write("Source columns:", sf_cols)
+        st.write("Target columns:", duckdb_cols)
+
+    sf_data_flat = flatten_rows(sf_data)
+    duckdb_data_flat = flatten_rows(duckdb_data)
+
+    only_in_source, only_in_target = compare_data(sf_data_flat, duckdb_data_flat)
+
+    if only_in_source or only_in_target:
+        st.write("### 🟢🔴 Data Differences Interleaved")
+        max_rows = max(len(only_in_source), len(only_in_target))
+        html = "<table style='border-collapse: collapse; width: 100%;'>"
+        html += "<tr><th>Data Source</th>" + "".join([f"<th>{col}</th>" for col in sf_cols]) + "</tr>"
+
+        for i in range(max_rows):
+            if i < len(only_in_source):
+                row = only_in_source[i]
+                color = "#00FF00"
+                row_data = list(row) if isinstance(row, (list, tuple)) else [row]
+                html += "<tr><td style='color:{}; font-weight:bold;'>Source</td>".format(color)
+                html += "".join([f"<td style='color:{color};'>{val}</td>" for val in row_data]) + "</tr>"
+            if i < len(only_in_target):
+                row = only_in_target[i]
+                color = "#FF0000"
+                row_data = list(row) if isinstance(row, (list, tuple)) else [row]
+                html += "<tr><td style='color:{}; font-weight:bold;'>Target</td>".format(color)
+                html += "".join([f"<td style='color:{color};'>{val}</td>" for val in row_data]) + "</tr>"
+
+        html += "</table>"
+        st.markdown(html, unsafe_allow_html=True)
+    else:
+        st.success("🎉 No differences found! Source and Target data are identical.")
